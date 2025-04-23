@@ -131,7 +131,6 @@ from langchain_google_vertexai._utils import (
     create_retry_decorator,
     get_generation_info,
     _format_model_name,
-    is_gemini_advanced,
     is_gemini_model,
     replace_defs_in_schema,
 )

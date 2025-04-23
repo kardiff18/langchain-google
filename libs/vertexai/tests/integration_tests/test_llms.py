@@ -6,14 +6,9 @@ Your end-user credentials would be used to make the calls (make sure you've run
 import json
 
 import pytest
-from langchain_core.messages import (
-    HumanMessage,
-    SystemMessage,
-)
 from langchain_core.outputs import LLMResult
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
-from langchain_google_vertexai import create_context_cache
 from langchain_google_vertexai.llms import VertexAI
 from tests.integration_tests.conftest import _DEFAULT_MODEL_NAME
 
