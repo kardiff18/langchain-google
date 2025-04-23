@@ -1,20 +1,329 @@
-from typing import Any, Generator, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import google.ai.generativelanguage as glm
 import pytest
 from langchain_core.documents import Document
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import BaseTool, InjectedToolArg, tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel
 from typing_extensions import Annotated
 
 from langchain_google_genai._function_utils import (
+    _convert_pydantic_to_genai_function,
+    _format_base_tool_to_function_declaration,
+    _format_dict_to_function_declaration,
+    _FunctionDeclarationLike,
     _tool_choice_to_tool_config,
     _ToolConfigDict,
     convert_to_genai_function_declarations,
     tool_to_dict,
 )
+
+
+def test_tool_with_anyof_nullable_param() -> None:
+    """
+    Example test that checks a string parameter marked as Optional,
+    verifying it's recognized as a 'string' & 'nullable'.
+    """
+
+    @tool(parse_docstring=True)
+    def possibly_none(
+        a: Optional[str] = None,
+    ) -> str:
+        """
+        A test function whose argument can be a string or None.
+
+        Args:
+          a: Possibly none.
+        """
+        return "value"
+
+    # Convert to OpenAI, then to GenAI, then to dict
+    oai_tool: dict[str, Any] = convert_to_openai_tool(possibly_none)
+    genai_tool = convert_to_genai_function_declarations([oai_tool])
+    genai_tool_dict = tool_to_dict(genai_tool)
+    assert isinstance(genai_tool_dict, dict), "Expected a dict."
+
+    function_declarations = genai_tool_dict.get("function_declarations")
+    assert isinstance(
+        function_declarations,
+        list,
+    ), "Expected a list."
+
+    fn_decl = function_declarations[0]
+    assert isinstance(fn_decl, dict), "Expected a dict."
+
+    parameters = fn_decl.get("parameters")
+    assert isinstance(parameters, dict), "Expected a dict."
+
+    properties = parameters.get("properties")
+    assert isinstance(properties, dict), "Expected a dict."
+
+    a_property = properties.get("a")
+    assert isinstance(a_property, dict), "Expected a dict."
+
+    assert a_property.get("type_") == glm.Type.STRING, "Expected 'a' to be STRING."
+    assert a_property.get("nullable") is True, "Expected 'a' to be marked as nullable."
+
+
+def test_tool_with_array_anyof_nullable_param() -> None:
+    """
+    Checks an array parameter marked as Optional, verifying it's recognized
+    as an 'array' & 'nullable', and that the items are correctly typed.
+    """
+
+    @tool(parse_docstring=True)
+    def possibly_none_list(
+        items: Optional[List[str]] = None,
+    ) -> str:
+        """
+        A test function whose argument can be a list of strings or None.
+
+        Args:
+          items: Possibly a list of strings or None.
+        """
+        return "value"
+
+    # Convert to OpenAI tool
+    oai_tool = convert_to_openai_tool(possibly_none_list)
+
+    # Convert to GenAI, then to dict
+    genai_tool = convert_to_genai_function_declarations([oai_tool])
+    genai_tool_dict = tool_to_dict(genai_tool)
+    assert isinstance(genai_tool_dict, dict), "Expected a dict."
+
+    function_declarations = genai_tool_dict.get("function_declarations")
+    assert isinstance(function_declarations, list), "Expected a list."
+
+    fn_decl = function_declarations[0]
+    assert isinstance(fn_decl, dict), "Expected a dict."
+
+    parameters = fn_decl.get("parameters")
+    assert isinstance(parameters, dict), "Expected a dict."
+
+    properties = parameters.get("properties")
+    assert isinstance(properties, dict), "Expected a dict."
+
+    items_property = properties.get("items")
+    assert isinstance(items_property, dict), "Expected a dict."
+
+    # Assertions
+    assert (
+        items_property.get("type_") == glm.Type.ARRAY
+    ), "Expected 'items' to be ARRAY."
+    assert items_property.get("nullable"), "Expected 'items' to be marked as nullable."
+    # Check that the array items are recognized as strings
+
+    items = items_property.get("items")
+    assert isinstance(items, dict), "Expected 'items' to be a dict."
+
+    assert items.get("type_") == glm.Type.STRING, "Expected array items to be STRING."
+
+
+def test_tool_with_nested_object_anyof_nullable_param() -> None:
+    """
+    Checks an object parameter (dict) marked as Optional, verifying it's recognized
+    as an 'object' but defaults to string if there are no real properties,
+    and that it is 'nullable'.
+    """
+
+    @tool(parse_docstring=True)
+    def possibly_none_dict(
+        data: Optional[dict] = None,
+    ) -> str:
+        """
+        A test function whose argument can be an object (dict) or None.
+
+        Args:
+          data: Possibly a dict or None.
+        """
+        return "value"
+
+    # Convert to OpenAI, then to GenAI, then to dict
+    oai_tool = convert_to_openai_tool(possibly_none_dict)
+    genai_tool = convert_to_genai_function_declarations([oai_tool])
+    genai_tool_dict = tool_to_dict(genai_tool)
+    assert isinstance(genai_tool_dict, dict), "Expected a dict."
+
+    function_declarations = genai_tool_dict.get("function_declarations")
+    assert isinstance(function_declarations, list), "Expected a list."
+
+    fn_decl = function_declarations[0]
+    assert isinstance(fn_decl, dict), "Expected a dict."
+
+    parameters = fn_decl.get("parameters")
+    assert isinstance(parameters, dict), "Expected a dict."
+
+    properties = parameters.get("properties")
+    assert isinstance(properties, dict), "Expected a dict."
+
+    data_property = properties.get("data")
+    assert isinstance(data_property, dict), "Expected a dict."
+
+    assert data_property.get("type_") in [
+        glm.Type.OBJECT,
+        glm.Type.STRING,
+    ], "Expected 'data' to be recognized as an OBJECT or fallback to STRING."
+    assert (
+        data_property.get("nullable") is True
+    ), "Expected 'data' to be marked as nullable."
+
+
+def test_tool_with_enum_anyof_nullable_param() -> None:
+    """
+    Checks a parameter with an enum, marked as Optional, verifying it's recognized
+    as 'string' & 'nullable', and that the 'enum' field is captured.
+    """
+
+    @tool(parse_docstring=True)
+    def possibly_none_enum(
+        status: Optional[str] = None,
+    ) -> str:
+        """
+        A test function whose argument can be an enum string or None.
+
+        Args:
+          status: Possibly one of ("active", "inactive", "pending") or None.
+        """
+        return "value"
+
+    # Convert to OpenAI tool
+    oai_tool = convert_to_openai_tool(possibly_none_enum)
+
+    # Manually override the 'enum' for the 'status' property in the parameters
+    oai_tool["function"]["parameters"]["properties"]["status"]["enum"] = [
+        "active",
+        "inactive",
+        "pending",
+    ]
+
+    # Convert to GenAI, then to dict
+    genai_tool = convert_to_genai_function_declarations([oai_tool])
+    genai_tool_dict = tool_to_dict(genai_tool)
+    assert isinstance(genai_tool_dict, dict), "Expected a dict."
+
+    function_declarations = genai_tool_dict.get("function_declarations")
+    assert isinstance(function_declarations, list), "Expected a list."
+
+    fn_decl = function_declarations[0]
+    assert isinstance(fn_decl, dict), "Expected a dict."
+
+    parameters = fn_decl.get("parameters")
+    assert isinstance(parameters, dict), "Expected a dict."
+
+    properties = parameters.get("properties")
+    assert isinstance(properties, dict), "Expected a dict."
+
+    status_property = properties.get("status")
+    assert isinstance(status_property, dict), "Expected a dict."
+
+    # Assertions
+    assert (
+        status_property.get("type_") == glm.Type.STRING
+    ), "Expected 'status' to be STRING."
+    assert (
+        status_property.get("nullable") is True
+    ), "Expected 'status' to be marked as nullable."
+    assert status_property.get("enum") == [
+        "active",
+        "inactive",
+        "pending",
+    ], "Expected 'status' to have enum values."
+
+
+# reusable test inputs
+def search(question: str) -> str:
+    """Search tool"""
+    return question
+
+
+search_tool = tool(search)
+search_exp = glm.FunctionDeclaration(
+    name="search",
+    description="Search tool",
+    parameters=glm.Schema(
+        type=glm.Type.OBJECT,
+        description="Search tool",
+        properties={"question": glm.Schema(type=glm.Type.STRING)},
+        required=["question"],
+    ),
+)
+
+
+class SearchBaseTool(BaseTool):
+    def _run(self) -> None:
+        pass
+
+
+search_base_tool = SearchBaseTool(name="search", description="Search tool")
+search_base_tool_exp = glm.FunctionDeclaration(
+    name=search_base_tool.name,
+    description=search_base_tool.description,
+    parameters=glm.Schema(
+        type=glm.Type.OBJECT,
+        properties={
+            "__arg1": glm.Schema(type=glm.Type.STRING),
+        },
+        required=["__arg1"],
+    ),
+)
+
+
+class SearchModel(BaseModel):
+    """Search model"""
+
+    question: str
+
+
+search_model_schema = SearchModel.model_json_schema()
+search_model_dict = {
+    "name": search_model_schema["title"],
+    "description": search_model_schema["description"],
+    "parameters": search_model_schema,
+}
+search_model_exp = glm.FunctionDeclaration(
+    name="SearchModel",
+    description="Search model",
+    parameters=glm.Schema(
+        type=glm.Type.OBJECT,
+        description="Search model",
+        properties={
+            "question": glm.Schema(type=glm.Type.STRING),
+        },
+        required=["question"],
+    ),
+)
+
+search_model_exp_pyd = glm.FunctionDeclaration(
+    name="SearchModel",
+    description="Search model",
+    parameters=glm.Schema(
+        type=glm.Type.OBJECT,
+        properties={
+            "question": glm.Schema(type=glm.Type.STRING),
+        },
+        required=["question"],
+    ),
+)
+
+mock_dict = MagicMock(name="mock_dicts", wraps=_format_dict_to_function_declaration)
+mock_base_tool = MagicMock(
+    name="mock_base_tool", wraps=_format_base_tool_to_function_declaration
+)
+mock_pydantic = MagicMock(
+    name="mock_pydantic", wraps=_convert_pydantic_to_genai_function
+)
+
+SRC_EXP_MOCKS_DESC: List[
+    Tuple[_FunctionDeclarationLike, glm.FunctionDeclaration, List[MagicMock], str]
+] = [
+    (search, search_exp, [mock_base_tool], "plain function"),
+    (search_tool, search_exp, [mock_base_tool], "LC tool"),
+    (search_base_tool, search_base_tool_exp, [mock_base_tool], "LC base tool"),
+    (SearchModel, search_model_exp_pyd, [mock_pydantic], "Pydantic model"),
+    (search_model_dict, search_model_exp, [mock_dict], "dict"),
+]
 
 
 def test_format_tool_to_genai_function() -> None:
@@ -57,6 +366,37 @@ def test_format_tool_to_genai_function() -> None:
     assert function_declaration.name == "do_something_optional"
     assert function_declaration.parameters
     assert len(function_declaration.parameters.required) == 1
+
+    src = [src for src, _, _, _ in SRC_EXP_MOCKS_DESC]
+    fds = [fd for _, fd, _, _ in SRC_EXP_MOCKS_DESC]
+    expected = glm.Tool(function_declarations=fds)
+    result = convert_to_genai_function_declarations(src)
+    assert result == expected
+
+    src_2 = glm.Tool(google_search_retrieval={})
+    result = convert_to_genai_function_declarations([src_2])
+    assert result == src_2
+
+    src_3: Dict[str, Any] = {"google_search_retrieval": {}}
+    result = convert_to_genai_function_declarations([src_3])
+    assert result == src_2
+
+    src_4 = glm.Tool(google_search={})
+    result = convert_to_genai_function_declarations([src_4])
+    assert result == src_4
+
+    with pytest.raises(ValueError) as exc_info1:
+        _ = convert_to_genai_function_declarations(["fake_tool"])  # type: ignore
+    assert str(exc_info1.value).startswith("Unsupported tool")
+
+    with pytest.raises(Exception) as exc_info:
+        _ = convert_to_genai_function_declarations(
+            [
+                glm.Tool(google_search_retrieval={}),
+                glm.Tool(google_search_retrieval={}),
+            ]
+        )
+    assert str(exc_info.value).startswith("Providing multiple google_search_retrieval")
 
 
 def test_tool_with_annotated_optional_args() -> None:
@@ -297,6 +637,83 @@ def test_tool_to_dict_pydantic() -> None:
     gapic_tool = convert_to_genai_function_declarations([MyModel])
     tool_dict = tool_to_dict(gapic_tool)
     assert gapic_tool == convert_to_genai_function_declarations([tool_dict])
+
+
+def test_tool_to_dict_pydantic_nested() -> None:
+    class MyModel(BaseModel):
+        name: str
+        age: int
+
+    class Models(BaseModel):
+        models: list[MyModel]
+
+    gapic_tool = convert_to_genai_function_declarations([Models])
+    tool_dict = tool_to_dict(gapic_tool)
+    assert tool_dict == {
+        "function_declarations": [
+            {
+                "description": "",
+                "name": "Models",
+                "parameters": {
+                    "description": "",
+                    "enum": [],
+                    "format_": "",
+                    "max_items": "0",
+                    "min_items": "0",
+                    "nullable": False,
+                    "properties": {
+                        "models": {
+                            "description": "",
+                            "enum": [],
+                            "format_": "",
+                            "items": {
+                                "description": "MyModel",
+                                "enum": [],
+                                "format_": "",
+                                "max_items": "0",
+                                "min_items": "0",
+                                "nullable": False,
+                                "properties": {
+                                    "age": {
+                                        "description": "",
+                                        "enum": [],
+                                        "format_": "",
+                                        "max_items": "0",
+                                        "min_items": "0",
+                                        "nullable": False,
+                                        "properties": {},
+                                        "required": [],
+                                        "type_": 3,
+                                    },
+                                    "name": {
+                                        "description": "",
+                                        "enum": [],
+                                        "format_": "",
+                                        "max_items": "0",
+                                        "min_items": "0",
+                                        "nullable": False,
+                                        "properties": {},
+                                        "required": [],
+                                        "type_": 1,
+                                    },
+                                },
+                                "required": ["name", "age"],
+                                "type_": 6,
+                            },
+                            "max_items": "0",
+                            "min_items": "0",
+                            "nullable": False,
+                            "properties": {},
+                            "required": [],
+                            "type_": 5,
+                        }
+                    },
+                    "required": ["models"],
+                    "type_": 6,
+                },
+            }
+        ]
+    }
 
 
 def test_tool_to_dict_pydantic_without_import(mock_safe_import: MagicMock) -> None:

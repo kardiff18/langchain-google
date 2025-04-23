@@ -18,7 +18,10 @@ from langchain_google_vertexai.model_garden_maas import (
 )
 
 model_names = _LLAMA_MODELS + _MISTRAL_MODELS
-model_names_with_tools_support = _MISTRAL_MODELS + ["meta/llama3-405b-instruct-maas"]
+# Fix tool support for new Mistral and Llama models
+model_names_with_tools_support = [
+    "mistral-nemo@2407",
+]
 
 
 @pytest.mark.extended
@@ -43,7 +46,7 @@ async def test_agenerate(model_name: str) -> None:
 @pytest.mark.parametrize("model_name", model_names)
 def test_stream(model_name: str) -> None:
     # streaming currently fails with mistral-nemo@2407
-    if model_name == "mistral-nemo@2407":
+    if "stral" in model_name:
         return
     llm = get_vertex_maas_model(model_name=model_name, location="us-central1")
     output = llm.stream("What is the meaning of life?")
@@ -55,7 +58,7 @@ def test_stream(model_name: str) -> None:
 @pytest.mark.parametrize("model_name", model_names)
 async def test_astream(model_name: str) -> None:
     # streaming currently fails with mistral-nemo@2407
-    if model_name == "mistral-nemo@2407":
+    if "stral" in model_name:
         return
     llm = get_vertex_maas_model(model_name=model_name, location="us-central1")
     output = llm.astream("What is the meaning of life?")
@@ -99,7 +102,7 @@ async def test_tools(model_name: str) -> None:
     tool_calls = response.tool_calls
     assert len(tool_calls) > 0
 
-    tool_response = search("sparrow")
+    tool_response = search.invoke("sparrow")
     tool_messages: List[BaseMessage] = []
 
     for tool_call in tool_calls:

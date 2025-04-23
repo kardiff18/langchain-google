@@ -6,11 +6,25 @@ from langchain_google_community.bq_storage_vectorstores.bigquery import (
 from langchain_google_community.bq_storage_vectorstores.featurestore import (
     VertexFSVectorStore,
 )
+from langchain_google_community.calendar.toolkit import (
+    CalendarCreateEvent,
+    CalendarDeleteEvent,
+    CalendarMoveEvent,
+    CalendarSearchEvents,
+    CalendarToolkit,
+    CalendarUpdateEvent,
+    GetCalendarsInfo,
+    GetCurrentDatetime,
+)
 from langchain_google_community.docai import DocAIParser, DocAIParsingResults
 from langchain_google_community.documentai_warehouse import DocumentAIWarehouseRetriever
 from langchain_google_community.drive import GoogleDriveLoader
 from langchain_google_community.gcs_directory import GCSDirectoryLoader
 from langchain_google_community.gcs_file import GCSFileLoader
+from langchain_google_community.geocoding import (
+    GoogleGeocodingAPIWrapper,
+    GoogleGeocodingTool,
+)
 from langchain_google_community.gmail.loader import GMailLoader
 from langchain_google_community.gmail.toolkit import GmailToolkit
 from langchain_google_community.google_speech_to_text import SpeechToTextLoader
@@ -40,6 +54,14 @@ __all__ = [
     "BigQueryLoader",
     "BigQueryVectorStore",
     "BigQueryVectorSearch",
+    "CalendarCreateEvent",
+    "CalendarDeleteEvent",
+    "CalendarMoveEvent",
+    "CalendarSearchEvents",
+    "CalendarUpdateEvent",
+    "GetCalendarsInfo",
+    "GetCurrentDatetime",
+    "CalendarToolkit",
     "CloudVisionLoader",
     "CloudVisionParser",
     "DocAIParser",
@@ -50,6 +72,8 @@ __all__ = [
     "GMailLoader",
     "GmailToolkit",
     "GoogleDriveLoader",
+    "GoogleGeocodingAPIWrapper",
+    "GoogleGeocodingTool",
     "GooglePlacesAPIWrapper",
     "GooglePlacesTool",
     "GoogleSearchAPIWrapper",

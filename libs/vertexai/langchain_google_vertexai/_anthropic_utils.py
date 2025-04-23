@@ -1,3 +1,4 @@
+import base64
 import re
 import warnings
 from typing import (
@@ -16,6 +17,7 @@ from typing import (
     cast,
 )
 
+import validators
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -30,6 +32,11 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel
 
+from langchain_google_vertexai._image_utils import (
+    ImageBytesLoader,
+)
+from langchain_google_vertexai._utils import load_image_from_gcs
+
 if TYPE_CHECKING:
     from anthropic.types import (
         RawMessageStreamEvent,  # type: ignore[unused-ignore, import-not-found]
@@ -43,30 +50,89 @@ _message_type_lookups = {
 }
 
 
-def _format_image(image_url: str) -> Dict:
+def _format_image(image_url: str, project: Optional[str]) -> Dict:
     """Formats a message image to a dict for anthropic api."""
-    regex = r"^data:(?P<media_type>image/.+);base64,(?P<data>.+)$"
+    regex = r"^data:(?P<media_type>(?:image|application)/.+);base64,(?P<data>.+)$"
     match = re.match(regex, image_url)
-    if match is None:
-        raise ValueError(
-            "Anthropic only supports base64-encoded images currently."
-            " Example: data:image/png;base64,'/9j/4AAQSk'..."
+    if match:
+        return {
+            "type": "base64",
+            "media_type": match.group("media_type"),
+            "data": match.group("data"),
+        }
+    elif validators.url(image_url):
+        loader = ImageBytesLoader(project=project)
+        image_bytes = loader.load_bytes(image_url)
+        raw_mime_type = image_url.split(".")[-1].lower()
+        doc_type = "application" if raw_mime_type == "pdf" else "image"
+        mime_type = (
+            f"{doc_type}/jpeg"
+            if raw_mime_type == "jpg"
+            else f"{doc_type}/{raw_mime_type}"
         )
-    return {
-        "type": "base64",
-        "media_type": match.group("media_type"),
-        "data": match.group("data"),
-    }
+        return {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": base64.b64encode(image_bytes).decode("ascii"),
+        }
+    elif image_url.startswith("gs://"):
+        # Gets image and encodes to base64.
+        loader = ImageBytesLoader(project=project)
+        part = loader.load_part(image_url)
+        if part.file_data.mime_type:
+            mime_type = part.file_data.mime_type
+            image_data = load_image_from_gcs(image_url, project=project).data
+        else:
+            mime_type = part.inline_data.mime_type
+            image_data = part.inline_data.data
+        return {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": base64.b64encode(image_data).decode("ascii"),
+        }
+    else:
+        raise ValueError(
+            "Anthropic only supports base64-encoded images and urls currently."
+            " Example: data:image/png;base64,'/9j/4AAQSk'..."
+            " Example: https://your-valid-image-url.png"
+        )
 
 
-def _format_message_anthropic(message: Union[HumanMessage, AIMessage]):
-    role = _message_type_lookups[message.type]
+def _get_cache_control(message: BaseMessage) -> Optional[Dict[str, Any]]:
+    """Extract cache control from message's additional_kwargs or content block."""
+    return (
+        message.additional_kwargs.get("cache_control")
+        if isinstance(message.additional_kwargs, dict)
+        else None
+    )
+
+
+def _format_text_content(text: str) -> Dict[str, Union[str, Dict[str, Any]]]:
+    """Format text content."""
+    content: Dict[str, Union[str, Dict[str, Any]]] = {"type": "text", "text": text}
+    return content
+
+
+def _format_message_anthropic(
+    message: Union[HumanMessage, AIMessage, SystemMessage], project: Optional[str]
+):
+    """Format a message for Anthropic API.
+
+    Args:
+        message: The message to format. Can be HumanMessage, AIMessage, or SystemMessage.
+
+    Returns:
+        A dictionary with the formatted message, or None if the message is empty.
+    """  # noqa: E501
     content: List[Dict[str, Any]] = []
 
     if isinstance(message.content, str):
         if not message.content.strip():
             return None
-        content.append({"type": "text", "text": message.content})
+        message_dict = _format_text_content(message.content)
+        if cache_control := _get_cache_control(message):
+            message_dict["cache_control"] = cache_control
+        content.append(message_dict)
     elif isinstance(message.content, list):
         for block in message.content:
             if isinstance(block, str):
@@ -75,9 +141,8 @@ def _format_message_anthropic(message: Union[HumanMessage, AIMessage]):
                 # https://github.com/anthropics/anthropic-sdk-python/issues/461
                 if not block.strip():
                     continue
-                content.append({"type": "text", "text": block})
-
-            if isinstance(block, dict):
+                content.append(_format_text_content(block))
+            elif isinstance(block, dict):
                 if "type" not in block:
                     raise ValueError("Dict content block must have a type key")
 
@@ -97,10 +162,34 @@ def _format_message_anthropic(message: Union[HumanMessage, AIMessage]):
                         content.append(new_block)
                     continue
 
+                if block["type"] == "thinking":
+                    content.append(
+                        {
+                            k: v
+                            for k, v in block.items()
+                            if k in ("type", "thinking", "cache_control", "signature")
+                        }
+                    )
+                    continue
+
+                if block["type"] == "redacted_thinking":
+                    content.append(
+                        {
+                            k: v
+                            for k, v in block.items()
+                            if k in ("type", "cache_control", "data")
+                        }
+                    )
+                    continue
+
                 if block["type"] == "image_url":
                     # convert format
-                    new_block["source"] = _format_image(block["image_url"]["url"])
-                    content.append(new_block)
+                    source = _format_image(block["image_url"]["url"], project)
+                    if source["media_type"] == "application/pdf":
+                        doc_type = "document"
+                    else:
+                        doc_type = "image"
+                    content.append({"type": doc_type, "source": source})
                     continue
 
                 if block["type"] == "tool_use":
@@ -113,25 +202,27 @@ def _format_message_anthropic(message: Union[HumanMessage, AIMessage]):
                         if not is_unique:
                             continue
 
-                # all other block types
                 content.append(block)
     else:
         raise ValueError("Message should be a str, list of str or list of dicts")
 
-    # adding all tool calls
     if isinstance(message, AIMessage) and message.tool_calls:
         for tc in message.tool_calls:
             tu = cast(Dict[str, Any], _lc_tool_call_to_anthropic_tool_use_block(tc))
             content.append(tu)
 
-    return {"role": role, "content": content}
+    if message.type == "system":
+        return content
+    else:
+        return {"role": _message_type_lookups[message.type], "content": content}
 
 
 def _format_messages_anthropic(
     messages: List[BaseMessage],
-) -> Tuple[Optional[str], List[Dict]]:
+    project: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], List[Dict]]:
     """Formats messages for anthropic."""
-    system_message: Optional[str] = None
+    system_messages: Optional[Dict[str, Any]] = None
     formatted_messages: List[Dict] = []
 
     merged_messages = _merge_messages(messages)
@@ -139,20 +230,17 @@ def _format_messages_anthropic(
         if message.type == "system":
             if i != 0:
                 raise ValueError("System message must be at beginning of message list.")
-            if not isinstance(message.content, str):
-                raise ValueError(
-                    "System message must be a string, "
-                    f"instead was: {type(message.content)}"
-                )
-            system_message = message.content
+            fm = _format_message_anthropic(message, project)
+            if fm:
+                system_messages = fm
             continue
 
-        fm = _format_message_anthropic(message)
+        fm = _format_message_anthropic(message, project)
         if not fm:
             continue
         formatted_messages.append(fm)
 
-    return system_message, formatted_messages
+    return system_messages, formatted_messages
 
 
 class AnthropicTool(TypedDict):
@@ -286,6 +374,20 @@ def _make_message_chunk_from_anthropic_event(
                 content_block["index"] = event.index
                 content_block["type"] = "text"
                 message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "thinking_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "signature_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
         elif event.delta.type == "input_json_delta":
             content_block = event.delta.model_dump()
             content_block["index"] = event.index
@@ -323,3 +425,20 @@ def _tools_in_params(params: dict) -> bool:
     return "tools" in params or (
         "extra_body" in params and params["extra_body"].get("tools")
     )
+
+
+def _thinking_in_params(params: dict) -> bool:
+    return params.get("thinking", {}).get("type") == "enabled"
+
+
+def _documents_in_params(params: dict) -> bool:
+    for message in params.get("messages", []):
+        if isinstance(message.get("content"), list):
+            for block in message["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "document"
+                    and block.get("citations", {}).get("enabled")
+                ):
+                    return True
+    return False

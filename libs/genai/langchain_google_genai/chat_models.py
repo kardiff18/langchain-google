@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import uuid
 import warnings
+from difflib import get_close_matches
 from operator import itemgetter
 from typing import (
     Any,
@@ -22,6 +25,7 @@ from typing import (
     cast,
 )
 
+import filetype  # type: ignore[import]
 import google.api_core
 
 # TODO: remove ignore once the google package is published with types
@@ -32,9 +36,11 @@ from google.ai.generativelanguage_v1beta import (
 from google.ai.generativelanguage_v1beta.types import (
     Blob,
     Candidate,
+    CodeExecution,
     Content,
     FileData,
     FunctionCall,
+    FunctionDeclaration,
     FunctionResponse,
     GenerateContentRequest,
     GenerateContentResponse,
@@ -44,13 +50,7 @@ from google.ai.generativelanguage_v1beta.types import (
     ToolConfig,
     VideoMetadata,
 )
-from google.generativeai.caching import CachedContent  # type: ignore[import]
-from google.generativeai.types import Tool as GoogleTool  # type: ignore[import]
-from google.generativeai.types import caching_types, content_types
-from google.generativeai.types.content_types import (  # type: ignore[import]
-    FunctionDeclarationType,
-    ToolDict,
-)
+from google.ai.generativelanguage_v1beta.types import Tool as GoogleTool
 from langchain_core.callbacks.manager import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -65,18 +65,19 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    is_data_content_block,
 )
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.messages.tool import invalid_tool_call, tool_call, tool_call_chunk
 from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.output_parsers.openai_tools import (
-    JsonOutputToolsParser,
+    JsonOutputKeyToolsParser,
     PydanticToolsParser,
     parse_tool_calls,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable, RunnablePassthrough
-from langchain_core.utils import secret_from_env
+from langchain_core.runnables import Runnable, RunnableConfig, RunnablePassthrough
+from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import (
     BaseModel,
@@ -92,27 +93,38 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-from typing_extensions import Self
+from typing_extensions import Self, is_typeddict
 
 from langchain_google_genai._common import (
     GoogleGenerativeAIError,
     SafetySettingDict,
+    _BaseGoogleGenerativeAI,
     get_client_info,
 )
 from langchain_google_genai._function_utils import (
     _tool_choice_to_tool_config,
     _ToolChoiceType,
     _ToolConfigDict,
+    _ToolDict,
     convert_to_genai_function_declarations,
     is_basemodel_subclass_safe,
     tool_to_dict,
 )
-from langchain_google_genai._image_utils import ImageBytesLoader
-from langchain_google_genai.llms import _BaseGoogleGenerativeAI
+from langchain_google_genai._image_utils import (
+    ImageBytesLoader,
+    image_bytes_to_b64_string,
+)
 
 from . import _genai_extension as genaix
 
 logger = logging.getLogger(__name__)
+
+
+_FunctionDeclarationType = Union[
+    FunctionDeclaration,
+    dict[str, Any],
+    Callable[..., Any],
+]
 
 
 class ChatGoogleGenerativeAIError(GoogleGenerativeAIError):
@@ -229,7 +241,7 @@ async def _achat_with_retry(generation_method: Callable, **kwargs: Any) -> Any:
     return await _achat_with_retry(**kwargs)
 
 
-def _is_openai_parts_format(part: dict) -> bool:
+def _is_lc_content_block(part: dict) -> bool:
     return "type" in part
 
 
@@ -244,10 +256,29 @@ def _convert_to_parts(
         if isinstance(part, str):
             parts.append(Part(text=part))
         elif isinstance(part, Mapping):
-            # OpenAI Format
-            if _is_openai_parts_format(part):
+            if _is_lc_content_block(part):
                 if part["type"] == "text":
                     parts.append(Part(text=part["text"]))
+                elif is_data_content_block(part):
+                    if part["source_type"] == "url":
+                        bytes_ = image_loader._bytes_from_url(part["url"])
+                    elif part["source_type"] == "base64":
+                        bytes_ = base64.b64decode(part["data"])
+                    else:
+                        raise ValueError("source_type must be url or base64.")
+                    inline_data: dict = {"data": bytes_}
+                    if "mime_type" in part:
+                        inline_data["mime_type"] = part["mime_type"]
+                    else:
+                        source = cast(str, part.get("url") or part.get("data"))
+                        mime_type, _ = mimetypes.guess_type(source)
+                        if not mime_type:
+                            kind = filetype.guess(bytes_)
+                            if kind:
+                                mime_type = kind.mime
+                        if mime_type:
+                            inline_data["mime_type"] = mime_type
+                    parts.append(Part(inline_data=inline_data))
                 elif part["type"] == "image_url":
                     img_url = part["image_url"]
                     if isinstance(img_url, dict):
@@ -301,6 +332,53 @@ def _convert_to_parts(
     return parts
 
 
+def _convert_tool_message_to_part(
+    message: ToolMessage | FunctionMessage, name: Optional[str] = None
+) -> Part:
+    """Converts a tool or function message to a google part."""
+    # Legacy agent stores tool name in message.additional_kwargs instead of message.name
+    name = message.name or name or message.additional_kwargs.get("name")
+    response: Any
+    if not isinstance(message.content, str):
+        response = message.content
+    else:
+        try:
+            response = json.loads(message.content)
+        except json.JSONDecodeError:
+            response = message.content  # leave as str representation
+    part = Part(
+        function_response=FunctionResponse(
+            name=name,
+            response=(
+                {"output": response} if not isinstance(response, dict) else response
+            ),
+        )
+    )
+    return part
+
+
+def _get_ai_message_tool_messages_parts(
+    tool_messages: Sequence[ToolMessage], ai_message: AIMessage
+) -> list[Part]:
+    """
+    Finds relevant tool messages for the AI message and converts them to a single
+    list of Parts.
+    """
+    # We are interested only in the tool messages that are part of the AI message
+    tool_calls_ids = {tool_call["id"]: tool_call for tool_call in ai_message.tool_calls}
+    parts = []
+    for i, message in enumerate(tool_messages):
+        if not tool_calls_ids:
+            break
+        if message.tool_call_id in tool_calls_ids:
+            tool_call = tool_calls_ids[message.tool_call_id]
+            part = _convert_tool_message_to_part(message, name=tool_call.get("name"))
+            parts.append(part)
+            # remove the id from the dict, so that we do not iterate over it again
+            tool_calls_ids.pop(message.tool_call_id)
+    return parts
+
+
 def _parse_chat_history(
     input_messages: Sequence[BaseMessage], convert_system_message_to_human: bool = False
 ) -> Tuple[Optional[Content], List[Content]]:
@@ -310,14 +388,26 @@ def _parse_chat_history(
         warnings.warn("Convert_system_message_to_human will be deprecated!")
 
     system_instruction: Optional[Content] = None
-    for i, message in enumerate(input_messages):
-        if i == 0 and isinstance(message, SystemMessage):
-            system_instruction = Content(parts=_convert_to_parts(message.content))
+    messages_without_tool_messages = [
+        message for message in input_messages if not isinstance(message, ToolMessage)
+    ]
+    tool_messages = [
+        message for message in input_messages if isinstance(message, ToolMessage)
+    ]
+    for i, message in enumerate(messages_without_tool_messages):
+        if isinstance(message, SystemMessage):
+            system_parts = _convert_to_parts(message.content)
+            if i == 0:
+                system_instruction = Content(parts=system_parts)
+            elif system_instruction is not None:
+                system_instruction.parts.extend(system_parts)
+            else:
+                pass
             continue
         elif isinstance(message, AIMessage):
             role = "model"
             if message.tool_calls:
-                parts = []
+                ai_message_parts = []
                 for tool_call in message.tool_calls:
                     function_call = FunctionCall(
                         {
@@ -325,7 +415,13 @@ def _parse_chat_history(
                             "args": tool_call["args"],
                         }
                     )
-                    parts.append(Part(function_call=function_call))
+                    ai_message_parts.append(Part(function_call=function_call))
+                tool_messages_parts = _get_ai_message_tool_messages_parts(
+                    tool_messages=tool_messages, ai_message=message
+                )
+                messages.append(Content(role=role, parts=ai_message_parts))
+                messages.append(Content(role="user", parts=tool_messages_parts))
+                continue
             elif raw_function_call := message.additional_kwargs.get("function_call"):
                 function_call = FunctionCall(
                     {
@@ -344,60 +440,7 @@ def _parse_chat_history(
                 system_instruction = None
         elif isinstance(message, FunctionMessage):
             role = "user"
-            response: Any
-            if not isinstance(message.content, str):
-                response = message.content
-            else:
-                try:
-                    response = json.loads(message.content)
-                except json.JSONDecodeError:
-                    response = message.content  # leave as str representation
-            parts = [
-                Part(
-                    function_response=FunctionResponse(
-                        name=message.name,
-                        response=(
-                            {"output": response}
-                            if not isinstance(response, dict)
-                            else response
-                        ),
-                    )
-                )
-            ]
-        elif isinstance(message, ToolMessage):
-            role = "user"
-            prev_message: Optional[BaseMessage] = (
-                input_messages[i - 1] if i > 0 else None
-            )
-            if (
-                prev_message
-                and isinstance(prev_message, AIMessage)
-                and prev_message.tool_calls
-            ):
-                # message.name can be null for ToolMessage
-                name: str = prev_message.tool_calls[0]["name"]
-            else:
-                name = message.name  # type: ignore
-            tool_response: Any
-            if not isinstance(message.content, str):
-                tool_response = message.content
-            else:
-                try:
-                    tool_response = json.loads(message.content)
-                except json.JSONDecodeError:
-                    tool_response = message.content  # leave as str representation
-            parts = [
-                Part(
-                    function_response=FunctionResponse(
-                        name=name,
-                        response=(
-                            {"output": tool_response}
-                            if not isinstance(tool_response, dict)
-                            else tool_response
-                        ),
-                    )
-                )
-            ]
+            parts = [_convert_tool_message_to_part(message)]
         else:
             raise ValueError(
                 f"Unexpected message with type {type(message)} at the position {i}."
@@ -410,7 +453,7 @@ def _parse_chat_history(
 def _parse_response_candidate(
     response_candidate: Candidate, streaming: bool = False
 ) -> AIMessage:
-    content: Union[None, str, List[str]] = None
+    content: Union[None, str, List[Union[str, dict]]] = None
     additional_kwargs = {}
     tool_calls = []
     invalid_tool_calls = []
@@ -419,6 +462,9 @@ def _parse_response_candidate(
     for part in response_candidate.content.parts:
         try:
             text: Optional[str] = part.text
+            # Remove erroneous newline character if present
+            if text is not None:
+                text = text.rstrip("\n")
         except AttributeError:
             text = None
 
@@ -430,6 +476,61 @@ def _parse_response_candidate(
             elif isinstance(content, list) and text:
                 content.append(text)
             elif text:
+                raise Exception("Unexpected content type")
+
+        if hasattr(part, "executable_code") and part.executable_code is not None:
+            if part.executable_code.code and part.executable_code.language:
+                code_message = {
+                    "type": "executable_code",
+                    "executable_code": part.executable_code.code,
+                    "language": part.executable_code.language,
+                }
+                if not content:
+                    content = [code_message]
+                elif isinstance(content, str):
+                    content = [content, code_message]
+                elif isinstance(content, list):
+                    content.append(code_message)
+                else:
+                    raise Exception("Unexpected content type")
+
+        if (
+            hasattr(part, "code_execution_result")
+            and part.code_execution_result is not None
+        ):
+            if part.code_execution_result.output:
+                execution_result = {
+                    "type": "code_execution_result",
+                    "code_execution_result": part.code_execution_result.output,
+                }
+
+                if not content:
+                    content = [execution_result]
+                elif isinstance(content, str):
+                    content = [content, execution_result]
+                elif isinstance(content, list):
+                    content.append(execution_result)
+                else:
+                    raise Exception("Unexpected content type")
+
+        if part.inline_data.mime_type.startswith("image/"):
+            image_format = part.inline_data.mime_type[6:]
+            message = {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_bytes_to_b64_string(
+                        part.inline_data.data, image_format=image_format
+                    )
+                },
+            }
+
+            if not content:
+                content = [message]
+            elif isinstance(content, str) and message:
+                content = [content, message]
+            elif isinstance(content, list) and message:
+                content.append(message)
+            elif message:
                 raise Exception("Unexpected content type")
 
         if part.function_call:
@@ -475,6 +576,16 @@ def _parse_response_candidate(
                     )
     if content is None:
         content = ""
+    if any(isinstance(item, dict) and "executable_code" in item for item in content):
+        warnings.warn(
+            """
+        ⚠️ Warning: Output may vary each run.  
+        - 'executable_code': Always present.  
+        - 'execution_result' & 'image_url': May be absent for some queries.  
+
+        Validate before using in production.
+"""
+        )
 
     if streaming:
         return AIMessageChunk(
@@ -529,6 +640,8 @@ def _response_to_result(
         generation_info = {}
         if candidate.finish_reason:
             generation_info["finish_reason"] = candidate.finish_reason.name
+            # Add model_name in last chunk
+            generation_info["model_name"] = response.model_version
         generation_info["safety_ratings"] = [
             proto.Message.to_dict(safety_rating, use_integers_for_enums=False)
             for safety_rating in candidate.safety_ratings
@@ -617,7 +730,7 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         .. code-block:: python
 
             AIMessageChunk(content='J', response_metadata={'finish_reason': 'STOP', 'safety_ratings': []}, id='run-e905f4f4-58cb-4a10-a960-448a2bb649e3', usage_metadata={'input_tokens': 18, 'output_tokens': 1, 'total_tokens': 19})
-            AIMessageChunk(content="'adore programmer. \n", response_metadata={'finish_reason': 'STOP', 'safety_ratings': [{'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability': 'NEGLIGIBLE', 'blocked': False}]}, id='run-e905f4f4-58cb-4a10-a960-448a2bb649e3', usage_metadata={'input_tokens': 18, 'output_tokens': 5, 'total_tokens': 23})
+            AIMessageChunk(content="'adore programmer. \\n", response_metadata={'finish_reason': 'STOP', 'safety_ratings': [{'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability': 'NEGLIGIBLE', 'blocked': False}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability': 'NEGLIGIBLE', 'blocked': False}]}, id='run-e905f4f4-58cb-4a10-a960-448a2bb649e3', usage_metadata={'input_tokens': 18, 'output_tokens': 5, 'total_tokens': 23})
 
         .. code-block:: python
 
@@ -646,6 +759,109 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
 
             # batch:
             # await llm.abatch([messages])
+
+    Context Caching:
+        Context caching allows you to store and reuse content (e.g., PDFs, images) for faster processing.
+        The `cached_content` parameter accepts a cache name created via the Google Generative AI API.
+        Below are two examples: caching a single file directly and caching multiple files using `Part`.
+
+        Single File Example:
+        This caches a single file and queries it.
+
+        .. code-block:: python
+
+            from google import genai
+            from google.genai import types
+            import time
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain_core.messages import HumanMessage
+
+            client = genai.Client()
+
+            # Upload file
+            file = client.files.upload(file="./example_file")
+            while file.state.name == 'PROCESSING':
+                time.sleep(2)
+                file = client.files.get(name=file.name)
+
+            # Create cache
+            model = 'models/gemini-1.5-flash-001'
+            cache = client.caches.create(
+                model=model,
+                config=types.CreateCachedContentConfig(
+                    display_name='Cached Content',
+                    system_instruction=(
+                        'You are an expert content analyzer, and your job is to answer '
+                        'the user\'s query based on the file you have access to.'
+                    ),
+                    contents=[file],
+                    ttl="300s",
+                )
+            )
+
+            # Query with LangChain
+            llm = ChatGoogleGenerativeAI(
+                model=model,
+                cached_content=cache.name,
+            )
+            message = HumanMessage(content="Summarize the main points of the content.")
+            llm.invoke([message])
+
+        Multiple Files Example:
+        This caches two files using `Part` and queries them together.
+
+        .. code-block:: python
+
+            from google import genai
+            from google.genai.types import CreateCachedContentConfig, Content, Part
+            import time
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from langchain_core.messages import HumanMessage
+
+            client = genai.Client()
+
+            # Upload files
+            file_1 = client.files.upload(file="./file1")
+            while file_1.state.name == 'PROCESSING':
+                time.sleep(2)
+                file_1 = client.files.get(name=file_1.name)
+
+            file_2 = client.files.upload(file="./file2")
+            while file_2.state.name == 'PROCESSING':
+                time.sleep(2)
+                file_2 = client.files.get(name=file_2.name)
+
+            # Create cache with multiple files
+            contents = [
+                Content(
+                    role="user",
+                    parts=[
+                        Part.from_uri(file_uri=file_1.uri, mime_type=file_1.mime_type),
+                        Part.from_uri(file_uri=file_2.uri, mime_type=file_2.mime_type),
+                    ],
+                )
+            ]
+            model = "gemini-1.5-flash-001"
+            cache = client.caches.create(
+                model=model,
+                config=CreateCachedContentConfig(
+                    display_name='Cached Contents',
+                    system_instruction=(
+                        'You are an expert content analyzer, and your job is to answer '
+                        'the user\'s query based on the files you have access to.'
+                    ),
+                    contents=contents,
+                    ttl="300s",
+                )
+            )
+
+            # Query with LangChain
+            llm = ChatGoogleGenerativeAI(
+                model=model,
+                cached_content=cache.name,
+            )
+            message = HumanMessage(content="Provide a summary of the key information across both files.")
+            llm.invoke([message])
 
     Tool calling:
         .. code-block:: python
@@ -689,6 +905,16 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
              {'name': 'GetPopulation',
               'args': {'location': 'New York City, NY'},
               'id': '634582de-5186-4e4b-968b-f192f0a93678'}]
+
+    Use Search with Gemini 2:
+        .. code-block:: python
+
+            from google.ai.generativelanguage_v1beta.types import Tool as GenAITool
+            llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
+            resp = llm.invoke(
+                "When is the next total solar eclipse in US?",
+                tools=[GenAITool(google_search={})],
+            )
 
     Structured output:
         .. code-block:: python
@@ -740,7 +966,7 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
 
         .. code-block:: python
 
-            'The weather in this image appears to be sunny and pleasant. The sky is a bright blue with scattered white clouds, suggesting fair weather. The lush green grass and trees indicate a warm and possibly slightly breezy day. There are no signs of rain or storms. \n'
+            'The weather in this image appears to be sunny and pleasant. The sky is a bright blue with scattered white clouds, suggesting fair weather. The lush green grass and trees indicate a warm and possibly slightly breezy day. There are no signs of rain or storms.'
 
     Token usage:
         .. code-block:: python
@@ -771,11 +997,6 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
 
     client: Any = Field(default=None, exclude=True)  #: :meta private:
     async_client_running: Any = Field(default=None, exclude=True)  #: :meta private:
-    google_api_key: Optional[SecretStr] = Field(
-        alias="api_key", default_factory=secret_from_env("GOOGLE_API_KEY", default=None)
-    )
-    """Google AI API key.
-    If not specified will be read from env var ``GOOGLE_API_KEY``."""
     default_metadata: Sequence[Tuple[str, str]] = Field(
         default_factory=list
     )  #: :meta private:
@@ -794,6 +1015,28 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
     ``cachedContents/{cachedContent}``.
     """
 
+    def __init__(self, **kwargs: Any) -> None:
+        """Needed for arg validation."""
+        # Get all valid field names, including aliases
+        valid_fields = set()
+        for field_name, field_info in self.model_fields.items():
+            valid_fields.add(field_name)
+            if hasattr(field_info, "alias") and field_info.alias is not None:
+                valid_fields.add(field_info.alias)
+
+        # Check for unrecognized arguments
+        for arg in kwargs:
+            if arg not in valid_fields:
+                suggestions = get_close_matches(arg, valid_fields, n=1)
+                suggestion = (
+                    f" Did you mean: '{suggestions[0]}'?" if suggestions else ""
+                )
+                logger.warning(
+                    f"Unexpected argument '{arg}' "
+                    f"provided to ChatGoogleGenerativeAI.{suggestion}"
+                )
+        super().__init__(**kwargs)
+
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -806,6 +1049,14 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
     def _llm_type(self) -> str:
         return "chat-google-generative-ai"
 
+    @property
+    def _supports_code_execution(self) -> bool:
+        return (
+            "gemini-1.5-pro" in self.model
+            or "gemini-1.5-flash" in self.model
+            or "gemini-2" in self.model
+        )
+
     @classmethod
     def is_lc_serializable(self) -> bool:
         return True
@@ -813,8 +1064,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
     @model_validator(mode="after")
     def validate_environment(self) -> Self:
         """Validates params and passes them to google-generativeai package."""
-        if self.temperature is not None and not 0 <= self.temperature <= 1:
-            raise ValueError("temperature must be in the range [0.0, 1.0]")
+        if self.temperature is not None and not 0 <= self.temperature <= 2.0:
+            raise ValueError("temperature must be in the range [0.0, 2.0]")
 
         if self.top_p is not None and not 0 <= self.top_p <= 1:
             raise ValueError("top_p must be in the range [0.0, 1.0]")
@@ -822,7 +1073,9 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         if self.top_k is not None and self.top_k <= 0:
             raise ValueError("top_k must be positive")
 
-        if not self.model.startswith("models/"):
+        if not any(
+            self.model.startswith(prefix) for prefix in ("models/", "tunedModels/")
+        ):
             self.model = f"models/{self.model}"
 
         additional_headers = self.additional_headers or {}
@@ -859,12 +1112,17 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         # this check ensures that async client is only initialized
         # within an asyncio event loop to avoid the error
         if not self.async_client_running and _is_event_loop_running():
+            # async clients don't support "rest" transport
+            # https://github.com/googleapis/gapic-generator-python/issues/1962
+            transport = self.transport
+            if transport == "rest":
+                transport = "grpc_asyncio"
             self.async_client_running = genaix.build_generative_async_service(
                 credentials=self.credentials,
                 api_key=google_api_key,
                 client_info=get_client_info("ChatGoogleGenerativeAI"),
                 client_options=self.client_options,
-                transport=self.transport,
+                transport=transport,
             )
         return self.async_client_running
 
@@ -877,7 +1135,44 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
             "top_k": self.top_k,
             "n": self.n,
             "safety_settings": self.safety_settings,
+            "response_modalities": self.response_modalities,
         }
+
+    def invoke(
+        self,
+        input: LanguageModelInput,
+        config: Optional[RunnableConfig] = None,
+        *,
+        code_execution: Optional[bool] = None,
+        stop: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        """
+        Enable code execution. Supported on: gemini-1.5-pro, gemini-1.5-flash,
+        gemini-2.0-flash, and gemini-2.0-pro. When enabled, the model can execute
+        code to solve problems.
+        """
+
+        """Override invoke to add code_execution parameter."""
+
+        if code_execution is not None:
+            if not self._supports_code_execution:
+                raise ValueError(
+                    f"Code execution is only supported on Gemini 1.5 Pro, \
+                    Gemini 1.5 Flash, "
+                    f"Gemini 2.0 Flash, and Gemini 2.0 Pro models. \
+                    Current model: {self.model}"
+                )
+            if "tools" not in kwargs:
+                code_execution_tool = GoogleTool(code_execution=CodeExecution())
+                kwargs["tools"] = [code_execution_tool]
+
+            else:
+                raise ValueError(
+                    "Tools are already defined." "code_execution tool can't be defined"
+                )
+
+        return super().invoke(input, config, stop=stop, **kwargs)
 
     def _get_ls_params(
         self, stop: Optional[List[str]] = None, **kwargs: Any
@@ -910,6 +1205,7 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
                 "max_output_tokens": self.max_output_tokens,
                 "top_k": self.top_k,
                 "top_p": self.top_p,
+                "response_modalities": self.response_modalities,
             }.items()
             if v is not None
         }
@@ -923,8 +1219,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         *,
-        tools: Optional[Sequence[Union[ToolDict, GoogleTool]]] = None,
-        functions: Optional[Sequence[FunctionDeclarationType]] = None,
+        tools: Optional[Sequence[Union[_ToolDict, GoogleTool]]] = None,
+        functions: Optional[Sequence[_FunctionDeclarationType]] = None,
         safety_settings: Optional[SafetySettingDict] = None,
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         generation_config: Optional[Dict[str, Any]] = None,
@@ -957,8 +1253,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         stop: Optional[List[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         *,
-        tools: Optional[Sequence[Union[ToolDict, GoogleTool]]] = None,
-        functions: Optional[Sequence[FunctionDeclarationType]] = None,
+        tools: Optional[Sequence[Union[_ToolDict, GoogleTool]]] = None,
+        functions: Optional[Sequence[_FunctionDeclarationType]] = None,
         safety_settings: Optional[SafetySettingDict] = None,
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         generation_config: Optional[Dict[str, Any]] = None,
@@ -1006,8 +1302,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         *,
-        tools: Optional[Sequence[Union[ToolDict, GoogleTool]]] = None,
-        functions: Optional[Sequence[FunctionDeclarationType]] = None,
+        tools: Optional[Sequence[Union[_ToolDict, GoogleTool]]] = None,
+        functions: Optional[Sequence[_FunctionDeclarationType]] = None,
         safety_settings: Optional[SafetySettingDict] = None,
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         generation_config: Optional[Dict[str, Any]] = None,
@@ -1068,8 +1364,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         stop: Optional[List[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         *,
-        tools: Optional[Sequence[Union[ToolDict, GoogleTool]]] = None,
-        functions: Optional[Sequence[FunctionDeclarationType]] = None,
+        tools: Optional[Sequence[Union[_ToolDict, GoogleTool]]] = None,
+        functions: Optional[Sequence[_FunctionDeclarationType]] = None,
         safety_settings: Optional[SafetySettingDict] = None,
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         generation_config: Optional[Dict[str, Any]] = None,
@@ -1143,8 +1439,8 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         messages: List[BaseMessage],
         *,
         stop: Optional[List[str]] = None,
-        tools: Optional[Sequence[Union[ToolDict, GoogleTool]]] = None,
-        functions: Optional[Sequence[FunctionDeclarationType]] = None,
+        tools: Optional[Sequence[Union[_ToolDict, GoogleTool]]] = None,
+        functions: Optional[Sequence[_FunctionDeclarationType]] = None,
         safety_settings: Optional[SafetySettingDict] = None,
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         tool_choice: Optional[Union[_ToolChoiceType, bool]] = None,
@@ -1156,11 +1452,25 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
                 "Must specify at most one of tool_choice and tool_config, received "
                 f"both:\n\n{tool_choice=}\n\n{tool_config=}"
             )
+
         formatted_tools = None
-        if tools:
+        code_execution_tool = GoogleTool(code_execution=CodeExecution())
+        if tools == [code_execution_tool]:
+            formatted_tools = tools
+        elif tools:
             formatted_tools = [convert_to_genai_function_declarations(tools)]
         elif functions:
             formatted_tools = [convert_to_genai_function_declarations(functions)]
+
+        filtered_messages = []
+        for message in messages:
+            if isinstance(message, HumanMessage) and not message.content:
+                warnings.warn(
+                    "HumanMessage with empty content was removed to prevent API error"
+                )
+            else:
+                filtered_messages.append(message)
+        messages = filtered_messages
 
         system_instruction, history = _parse_chat_history(
             messages,
@@ -1173,9 +1483,20 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
                     f"be specified if 'tools' is specified."
                 )
                 raise ValueError(msg)
-            all_names = [
-                f.name for t in formatted_tools for f in t.function_declarations
-            ]
+            all_names: List[str] = []
+            for t in formatted_tools:
+                if hasattr(t, "function_declarations"):
+                    t_with_declarations = cast(Any, t)
+                    all_names.extend(
+                        f.name for f in t_with_declarations.function_declarations
+                    )
+                elif isinstance(t, GoogleTool) and hasattr(t, "code_execution"):
+                    continue
+                else:
+                    raise TypeError(
+                        f"Tool {t} doesn't have function_declarations attribute"
+                    )
+
             tool_config = _tool_choice_to_tool_config(tool_choice, all_names)
 
         formatted_tool_config = None
@@ -1228,16 +1549,29 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         include_raw: bool = False,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
+        _ = kwargs.pop("method", None)
+        _ = kwargs.pop("strict", None)
         if kwargs:
             raise ValueError(f"Received unsupported arguments {kwargs}")
+        tool_name = _get_tool_name(schema)  # type: ignore[arg-type]
         if isinstance(schema, type) and is_basemodel_subclass_safe(schema):
             parser: OutputParserLike = PydanticToolsParser(
                 tools=[schema], first_tool_only=True
             )
         else:
-            parser = JsonOutputToolsParser()
-        tool_choice = _get_tool_name(schema) if self._supports_tool_choice else None
-        llm = self.bind_tools([schema], tool_choice=tool_choice)
+            parser = JsonOutputKeyToolsParser(key_name=tool_name, first_tool_only=True)
+        tool_choice = tool_name if self._supports_tool_choice else None
+        try:
+            llm = self.bind_tools(
+                [schema],
+                tool_choice=tool_choice,
+                ls_structured_output_format={
+                    "kwargs": {"method": "function_calling"},
+                    "schema": convert_to_openai_tool(schema),
+                },
+            )
+        except Exception:
+            llm = self.bind_tools([schema], tool_choice=tool_choice)
         if include_raw:
             parser_with_fallback = RunnablePassthrough.assign(
                 parsed=itemgetter("raw") | parser, parsing_error=lambda _: None
@@ -1251,7 +1585,9 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
 
     def bind_tools(
         self,
-        tools: Sequence[Union[ToolDict, GoogleTool]],
+        tools: Sequence[
+            dict[str, Any] | type | Callable[..., Any] | BaseTool | GoogleTool
+        ],
         tool_config: Optional[Union[Dict, _ToolConfigDict]] = None,
         *,
         tool_choice: Optional[Union[_ToolChoiceType, bool]] = None,
@@ -1288,90 +1624,6 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
             pass
         return self.bind(tools=formatted_tools, **kwargs)
 
-    def create_cached_content(
-        self,
-        contents: Union[List[BaseMessage], content_types.ContentsType],
-        *,
-        display_name: str | None = None,
-        tools: Union[ToolDict, GoogleTool, None] = None,
-        tool_choice: Optional[Union[_ToolChoiceType, bool]] = None,
-        ttl: Optional[caching_types.TTLTypes] = None,
-        expire_time: Optional[caching_types.ExpireTimeTypes] = None,
-    ) -> str:
-        """
-
-        Args:
-            display_name: The user-generated meaningful display name
-                of the cached content. `display_name` must be no
-                more than 128 unicode characters.
-            contents: Contents to cache.
-            tools: A list of `Tools` the model may use to generate response.
-            tool_choice: Which tool to require the model to call.
-            ttl: TTL for cached resource (in seconds). Defaults to 1 hour.
-                 `ttl` and `expire_time` are exclusive arguments.
-            expire_time: Expiration time for cached resource.
-                `ttl` and `expire_time` are exclusive arguments.
-        """
-        system: Optional[content_types.ContentType] = None
-        genai_contents: list = []
-        if all(isinstance(c, BaseMessage) for c in contents):
-            system, genai_contents = _parse_chat_history(
-                contents,
-                convert_system_message_to_human=self.convert_system_message_to_human,
-            )
-        elif any(isinstance(c, BaseMessage) for c in contents):
-            raise ValueError(
-                f"'contents' must either be a list of "
-                f"langchain_core.messages.BaseMessage or a list "
-                f"google.generativeai.types.content_types.ContentType, but not a mix "
-                f"of the two. Received {contents}"
-            )
-        else:
-            for content in contents:
-                if hasattr(content, "role") and content.role == "system":
-                    if system is not None:
-                        warnings.warn(
-                            "Received multiple pieces of content with role 'system'. "
-                            "Should only be one set of system instructions. Ignoring "
-                            "all but the first 'system' content."
-                        )
-                    else:
-                        system = content
-                elif isinstance(content, dict) and content.get("role") == "system":
-                    if system is not None:
-                        warnings.warn(
-                            "Received multiple pieces of content with role 'system'. "
-                            "Should only be one set of system instructions. Ignoring "
-                            "all but the first 'system' content."
-                        )
-                    else:
-                        system = content
-                else:
-                    genai_contents.append(content)
-        if tools:
-            genai_tools = [convert_to_genai_function_declarations(tools)]
-        else:
-            genai_tools = None
-        if tool_choice and genai_tools:
-            all_names = [f.name for t in genai_tools for f in t.function_declarations]
-            tool_config = _tool_choice_to_tool_config(tool_choice, all_names)
-            genai_tool_config = ToolConfig(
-                function_calling_config=tool_config["function_calling_config"]
-            )
-        else:
-            genai_tool_config = None
-        cached_content = CachedContent.create(
-            model=self.model,
-            system_instruction=system,
-            contents=genai_contents,
-            display_name=display_name,
-            tools=genai_tools,
-            tool_config=genai_tool_config,
-            ttl=ttl,
-            expire_time=expire_time,
-        )
-        return cached_content.name
-
     @property
     def _supports_tool_choice(self) -> bool:
         return (
@@ -1382,7 +1634,13 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
 
 
 def _get_tool_name(
-    tool: Union[ToolDict, GoogleTool],
+    tool: Union[_ToolDict, GoogleTool, Dict],
 ) -> str:
-    genai_tool = tool_to_dict(convert_to_genai_function_declarations([tool]))
-    return [f["name"] for f in genai_tool["function_declarations"]][0]  # type: ignore[index]
+    try:
+        genai_tool = tool_to_dict(convert_to_genai_function_declarations([tool]))
+        return [f["name"] for f in genai_tool["function_declarations"]][0]  # type: ignore[index]
+    except ValueError as e:  # other TypedDict
+        if is_typeddict(tool):
+            return convert_to_openai_tool(cast(Dict, tool))["function"]["name"]
+        else:
+            raise e

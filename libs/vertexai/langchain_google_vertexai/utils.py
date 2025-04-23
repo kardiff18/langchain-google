@@ -4,10 +4,7 @@ from typing import List, Optional, Union
 from langchain_core.messages import BaseMessage
 from vertexai.preview import caching  # type: ignore
 
-from langchain_google_vertexai._utils import (
-    _format_model_name,
-    is_gemini_advanced,
-)
+from langchain_google_vertexai._image_utils import ImageBytesLoader
 from langchain_google_vertexai.chat_models import (
     ChatVertexAI,
     _parse_chat_history_gemini,
@@ -63,7 +60,9 @@ def create_context_cache(
         error_msg = f"Model {model_name} doesn't support context catching"
         raise ValueError(error_msg)
 
-    system_instruction, contents = _parse_chat_history_gemini(messages, model.project)
+    system_instruction, contents = _parse_chat_history_gemini(
+        messages, ImageBytesLoader(project=model.project)
+    )
 
     if tool_config:
         tool_config = _format_tool_config(tool_config)

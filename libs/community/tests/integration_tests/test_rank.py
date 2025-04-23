@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import Any, List
 from unittest.mock import create_autospec
 
 import pytest
@@ -16,8 +16,8 @@ from langchain_google_community.vertex_rank import VertexAIRank
 class CustomRankingRetriever(BaseRetriever):
     """Retriever that directly uses a mock retriever and a ranking API."""
 
-    base_retriever: BaseRetriever = Field(default=None)
-    ranker: VertexAIRank = Field(default=None)
+    base_retriever: BaseRetriever = Field(default=None)  # type: ignore
+    ranker: VertexAIRank = Field(default=None)  # type: ignore
 
     def __init__(self, base_retriever: BaseRetriever, ranker: VertexAIRank):
         super().__init__()  # Call to the superclass's constructor
@@ -39,7 +39,11 @@ class CustomRankingRetriever(BaseRetriever):
 
 class MockVectorStoreRetriever(VectorStoreRetriever):
     def _get_relevant_documents(
-        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun,
+        **kwargs: Any,
     ) -> List[Document]:
         return [
             Document(
